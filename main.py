@@ -94,17 +94,40 @@ async def safe_edit_message(query, text, reply_markup=None):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Captures the working chat ID and displays the control panel."""
-    chat_id = update.effective_chat.id
+    chat = update.effective_chat
+    if not chat:
+        logger.warning("Received /start without an effective chat.")
+        return
+
+    chat_id = chat.id
     bot_state["target_chat_id"] = chat_id
     save_state()
     
     welcome_text = (
         "🤖 *Reddit [FS] Monitor Initialized!*\n\n"
         f"📍 *Working Chat Captured:* `{chat_id}`\n"
+        f"📣 *Chat Type:* `{chat.type}`\n"
         f"You will receive new selling posts from r/{bot_state['subreddit']}.\n\n"
-        "Use `/subreddit name` to select another subreddit."
+        "Use `/subreddit name` to select another subreddit.\n"
+        "Use `/chatid` to display this chat ID again."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_keyboard())
+
+async def chat_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays and registers the current private or group chat."""
+    chat = update.effective_chat
+    if not chat or not update.message:
+        logger.warning("Received /chatid without an effective chat.")
+        return
+
+    bot_state["target_chat_id"] = chat.id
+    save_state()
+    await update.message.reply_text(
+        f"Active chat ID: `{chat.id}`\n"
+        f"Chat type: `{chat.type}`\n"
+        f"Polling r/{bot_state['subreddit']} every 30 seconds.",
+        parse_mode="Markdown",
+    )
 
 async def subreddit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Selects the subreddit to poll for the current target chat."""
@@ -125,7 +148,12 @@ async def subreddit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    bot_state["target_chat_id"] = update.effective_chat.id
+    chat = update.effective_chat
+    if not chat:
+        logger.warning("Received subreddit command without an effective chat.")
+        return
+
+    bot_state["target_chat_id"] = chat.id
     bot_state["subreddit"] = subreddit
     bot_state["seen_ids"].clear()
     save_state()
@@ -214,6 +242,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler(["sub", "subreddit"], subreddit_command))
+    application.add_handler(CommandHandler("chatid", chat_id_command))
     application.add_handler(CallbackQueryHandler(button_handler))
 
     job_queue = application.job_queue
@@ -221,7 +250,9 @@ def main():
     job_queue.run_repeating(check_reddit_rss, interval=30, first=5)
 
     print(f"[*] r/{bot_state['subreddit']} [FS] RSS monitor running every 30 seconds.")
-    application.run_polling()
+    # Discard updates accumulated while the bot was stopped. Only one process
+    # using this token may call getUpdates at a time.
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
