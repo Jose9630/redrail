@@ -28,6 +28,8 @@ SUBREDDIT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,20}$")
 # Enable logging
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 if not TELEGRAM_BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN environment variable is missing! Set it before running the script.")
