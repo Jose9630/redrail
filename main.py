@@ -1,6 +1,8 @@
+import asyncio
 import json
 import logging
 import os
+import re
 import feedparser
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,11 +16,13 @@ from telegram.ext import (
 
 # ==================== CONFIGURATION ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DEFAULT_SUBREDDIT = os.getenv("DEFAULT_SUBREDDIT", "homelabsales")
 # Reddit-compliant descriptive User-Agent
 HEADERS = {
     "User-Agent": "linux:reddit.rss.monitor:v3.0 (by /u/script_user)"
 }
 STATE_FILE = "bot_state.json"
+SUBREDDIT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,20}$")
 # =======================================================
 
 # Enable logging
@@ -29,6 +33,12 @@ if not TELEGRAM_BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN environment variable is missing! Set it before running the script.")
     exit(1)
 
+def valid_subreddit(value):
+    """Returns a safe subreddit name, falling back to the default."""
+    if isinstance(value, str) and SUBREDDIT_PATTERN.fullmatch(value):
+        return value
+    return "homelabsales"
+
 def load_state():
     """Loads bot state from a local JSON file to persist across restarts."""
     if os.path.exists(STATE_FILE):
@@ -37,7 +47,8 @@ def load_state():
                 data = json.load(f)
                 return {
                     "target_chat_id": data.get("target_chat_id"),
-                    "seen_ids": set(),
+                    "seen_ids": set(data.get("seen_ids", [])),
+                    "subreddit": valid_subreddit(data.get("subreddit", DEFAULT_SUBREDDIT)),
                     "is_running": data.get("is_running", True)
                 }
         except Exception as e:
@@ -46,6 +57,7 @@ def load_state():
     return {
         "target_chat_id": None,
         "seen_ids": set(),
+        "subreddit": valid_subreddit(DEFAULT_SUBREDDIT),
         "is_running": True
     }
 
@@ -54,6 +66,8 @@ def save_state():
     try:
         data = {
             "target_chat_id": bot_state["target_chat_id"],
+            "seen_ids": list(bot_state["seen_ids"]),
+            "subreddit": bot_state["subreddit"],
             "is_running": bot_state["is_running"]
         }
         with open(STATE_FILE, "w") as f:
@@ -83,11 +97,40 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state()
     
     welcome_text = (
-        "🤖 *Homelabsales [FS] Monitor Initialized!*\n\n"
+        "🤖 *Reddit [FS] Monitor Initialized!*\n\n"
         f"📍 *Working Chat Captured:* `{chat_id}`\n"
-        "You will receive new selling posts from r/homelabsales."
+        f"You will receive new selling posts from r/{bot_state['subreddit']}.\n\n"
+        "Use `/subreddit name` to select another subreddit."
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_main_keyboard())
+
+async def subreddit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Selects the subreddit to poll for the current target chat."""
+    if not update.message:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            f"Usage: `/subreddit name`\nCurrently selected: r/{bot_state['subreddit']}",
+            parse_mode="Markdown",
+        )
+        return
+
+    subreddit = context.args[0].strip()
+    if not SUBREDDIT_PATTERN.fullmatch(subreddit):
+        await update.message.reply_text(
+            "Invalid subreddit name. Use 2-21 letters, numbers, underscores, or hyphens."
+        )
+        return
+
+    bot_state["target_chat_id"] = update.effective_chat.id
+    bot_state["subreddit"] = subreddit
+    bot_state["seen_ids"].clear()
+    save_state()
+    await update.message.reply_text(
+        f"Now polling r/{subreddit} every 30 seconds for [FS] posts.",
+        reply_markup=get_main_keyboard(),
+    )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles inline button clicks."""
@@ -100,6 +143,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = (
             "📊 *Bot Status Report*\n\n"
             f"• *Active:* {'🟢 Running' if bot_state['is_running'] else '🔴 Stopped'}\n"
+            f"• *Subreddit:* `r/{bot_state['subreddit']}`\n"
             f"• *Target Chat ID:* {chat_status}\n"
             f"• *Cached Post IDs:* {len(bot_state['seen_ids'])}"
         )
@@ -109,14 +153,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(query, "🛠 *Control Panel:*", reply_markup=get_main_keyboard())
 
 async def check_reddit_rss(context: ContextTypes.DEFAULT_TYPE):
-    """Fetches new homelabsales posts and alerts on [FS] listings."""
+    """Fetches new subreddit posts and alerts on [FS] listings."""
     if not bot_state["is_running"] or not bot_state["target_chat_id"]:
         return
 
     try:
-        # Fetch the subreddit feed once per cycle.
-        rss_url = "https://www.reddit.com/r/homelabsales/new.rss"
-        response = requests.get(rss_url, headers=HEADERS, timeout=15)
+        subreddit = bot_state["subreddit"]
+        rss_url = f"https://www.reddit.com/r/{subreddit}/new.rss"
+        response = await asyncio.to_thread(
+            requests.get, rss_url, headers=HEADERS, timeout=15
+        )
         
         if response.status_code != 200:
             logger.warning(f"Reddit RSS returned status code {response.status_code}")
@@ -130,13 +176,14 @@ async def check_reddit_rss(context: ContextTypes.DEFAULT_TYPE):
             post_id = entry.get("id", entry.get("link"))
             
             if post_id not in bot_state["seen_ids"]:
+                if not post_id:
+                    continue
                 bot_state["seen_ids"].add(post_id)
 
                 if len(bot_state["seen_ids"]) > 5000:
                     bot_state["seen_ids"].pop()
 
                 title = entry.get("title", "")
-                summary = entry.get("summary", "")
                 if not title.lstrip().lower().startswith("[fs]"):
                     continue
 
@@ -144,7 +191,7 @@ async def check_reddit_rss(context: ContextTypes.DEFAULT_TYPE):
                 author = entry.get("author", "Unknown")
 
                 alert_text = (
-                    "HOMELABSALE LISTING\n\n"
+                    "REDDIT LISTING\n\n"
                     f"Title: {title}\n"
                     f"Author: {author}\n"
                     f"{link}"
@@ -155,21 +202,23 @@ async def check_reddit_rss(context: ContextTypes.DEFAULT_TYPE):
                     text=alert_text,
                     disable_web_page_preview=True
                 )
-
     except Exception as e:
-        logger.error(f"Error fetching r/homelabsales RSS feed: {e}")
+        logger.error(f"Error fetching r/{bot_state['subreddit']} RSS feed: {e}")
+    finally:
+        save_state()
 
 def main():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler(["sub", "subreddit"], subreddit_command))
     application.add_handler(CallbackQueryHandler(button_handler))
 
     job_queue = application.job_queue
-    # Checks r/homelabsales/new.rss every 30 seconds.
+    # Checks the selected subreddit every 30 seconds.
     job_queue.run_repeating(check_reddit_rss, interval=30, first=5)
 
-    print("[*] r/homelabsales [FS] RSS monitor running... Send /start in your chat.")
+    print(f"[*] r/{bot_state['subreddit']} [FS] RSS monitor running every 30 seconds.")
     application.run_polling()
 
 if __name__ == "__main__":
