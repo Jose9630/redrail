@@ -1,5 +1,5 @@
 python-telegram-bot[job-queue]==21.6
-feedparser==6.0.10
+feedparser==6.0.12
 requests==2.31.0
 flask==3.0.2
 python-dotenv==1.0.1

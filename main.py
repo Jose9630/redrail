@@ -3,10 +3,13 @@ import json
 import logging
 import os
 import re
+import time
+from pathlib import Path
 import feedparser
 import requests
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict, RetryAfter, TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -15,14 +18,17 @@ from telegram.ext import (
 )
 
 # ==================== CONFIGURATION ====================
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / "TELEGRAM_BOT_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEFAULT_SUBREDDIT = os.getenv("DEFAULT_SUBREDDIT", "homelabsales")
 # Reddit-compliant descriptive User-Agent
 HEADERS = {
     "User-Agent": "linux:reddit.rss.monitor:v3.0 (by /u/script_user)"
 }
-STATE_FILE = "bot_state.json"
+STATE_FILE = Path(__file__).resolve().parent / "bot_state.json"
 SUBREDDIT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,20}$")
+RSS_POLL_INTERVAL = 30
+MAX_REDDIT_BACKOFF = 15 * 60
 # =======================================================
 
 # Enable logging
@@ -78,6 +84,9 @@ def save_state():
         logger.error(f"Error saving state file: {e}")
 
 bot_state = load_state()
+reddit_retry_at = 0.0
+reddit_backoff = RSS_POLL_INTERVAL
+reddit_request_lock = asyncio.Lock()
 
 def get_main_keyboard():
     """Generates the interactive control panel markup."""
@@ -94,6 +103,7 @@ async def safe_edit_message(query, text, reply_markup=None):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Captures the working chat ID and displays the control panel."""
+    del context
     chat = update.effective_chat
     if not chat:
         logger.warning("Received /start without an effective chat.")
@@ -104,6 +114,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state()
     
     welcome_text = (
+        "✅ *Bot is online and listening for commands.*\n\n"
         "🤖 *Reddit [FS] Monitor Initialized!*\n\n"
         f"📍 *Working Chat Captured:* `{chat_id}`\n"
         f"📣 *Chat Type:* `{chat.type}`\n"
@@ -115,6 +126,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def chat_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays and registers the current private or group chat."""
+    del context
     chat = update.effective_chat
     if not chat or not update.message:
         logger.warning("Received /chatid without an effective chat.")
@@ -164,6 +176,7 @@ async def subreddit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles inline button clicks."""
+    del context
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -184,19 +197,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_reddit_rss(context: ContextTypes.DEFAULT_TYPE):
     """Fetches new subreddit posts and alerts on [FS] listings."""
+    global reddit_backoff, reddit_retry_at
+
     if not bot_state["is_running"] or not bot_state["target_chat_id"]:
         return
 
+    if time.monotonic() < reddit_retry_at:
+        return
+
+    if reddit_request_lock.locked():
+        logger.warning("Skipping RSS check because the previous request is still running.")
+        return
+
     try:
-        subreddit = bot_state["subreddit"]
-        rss_url = f"https://www.reddit.com/r/{subreddit}/new.rss"
-        response = await asyncio.to_thread(
-            requests.get, rss_url, headers=HEADERS, timeout=15
-        )
-        
-        if response.status_code != 200:
-            logger.warning(f"Reddit RSS returned status code {response.status_code}")
+        async with reddit_request_lock:
+            subreddit = bot_state["subreddit"]
+            rss_url = f"https://www.reddit.com/r/{subreddit}/new.rss"
+            response = await asyncio.to_thread(
+                requests.get, rss_url, headers=HEADERS, timeout=15
+            )
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            try:
+                delay = max(float(retry_after), RSS_POLL_INTERVAL) if retry_after else reddit_backoff
+            except ValueError:
+                delay = reddit_backoff
+            reddit_retry_at = time.monotonic() + min(delay, MAX_REDDIT_BACKOFF)
+            reddit_backoff = min(reddit_backoff * 2, MAX_REDDIT_BACKOFF)
+            logger.warning(
+                "Reddit RSS rate limit (429); retrying in %.0f seconds.",
+                min(delay, MAX_REDDIT_BACKOFF),
+            )
             return
+
+        if response.status_code != 200:
+            logger.warning("Reddit RSS returned status code %s", response.status_code)
+            return
+
+        reddit_backoff = RSS_POLL_INTERVAL
+        reddit_retry_at = 0.0
 
         feed = feedparser.parse(response.text)
         if not feed or not feed.entries:
@@ -204,50 +244,116 @@ async def check_reddit_rss(context: ContextTypes.DEFAULT_TYPE):
 
         for entry in reversed(feed.entries):
             post_id = entry.get("id", entry.get("link"))
-            
-            if post_id not in bot_state["seen_ids"]:
-                if not post_id:
-                    continue
+            if not post_id or post_id in bot_state["seen_ids"]:
+                continue
+
+            title = entry.get("title", "")
+            if not title.lstrip().lower().startswith("[fs]"):
                 bot_state["seen_ids"].add(post_id)
+                continue
 
-                if len(bot_state["seen_ids"]) > 5000:
-                    bot_state["seen_ids"].pop()
+            link = entry.get("link", "")
+            author = entry.get("author", "Unknown")
+            alert_text = (
+                "REDDIT LISTING\n\n"
+                f"Title: {title}\n"
+                f"Author: {author}\n"
+                f"{link}"
+            )
 
-                title = entry.get("title", "")
-                if not title.lstrip().lower().startswith("[fs]"):
-                    continue
-
-                link = entry.get("link", "")
-                author = entry.get("author", "Unknown")
-
-                alert_text = (
-                    "REDDIT LISTING\n\n"
-                    f"Title: {title}\n"
-                    f"Author: {author}\n"
-                    f"{link}"
-                )
-
-                await context.bot.send_message(
-                    chat_id=bot_state["target_chat_id"],
-                    text=alert_text,
-                    disable_web_page_preview=True
-                )
-    except Exception as e:
-        logger.error(f"Error fetching r/{bot_state['subreddit']} RSS feed: {e}")
+            await send_message_with_retry(
+                context,
+                bot_state["target_chat_id"],
+                alert_text,
+            )
+            bot_state["seen_ids"].add(post_id)
+            if len(bot_state["seen_ids"]) > 5000:
+                bot_state["seen_ids"].pop()
+    except requests.RequestException:
+        logger.exception("Network error fetching r/%s RSS feed.", bot_state["subreddit"])
     finally:
         save_state()
 
+
+async def send_message_with_retry(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+) -> None:
+    """Sends a Telegram message once more after a flood-limit response."""
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            disable_web_page_preview=True,
+        )
+    except RetryAfter as error:
+        delay = min(error.retry_after + 1, MAX_REDDIT_BACKOFF)
+        logger.warning("Telegram rate limit (429); retrying in %.0f seconds.", delay)
+        await asyncio.sleep(delay)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            disable_web_page_preview=True,
+        )
+
+async def notify_bot_started(application):
+    """Announces readiness in the previously registered target chat."""
+    target_chat_id = bot_state["target_chat_id"]
+    if not target_chat_id:
+        logger.info("Bot is online, but no target chat is registered yet. Send /start in Telegram.")
+        return
+
+    try:
+        await application.bot.send_message(
+            chat_id=target_chat_id,
+            text="✅ Bot is online and listening for commands.",
+        )
+        logger.info("Startup notification sent to target chat %s.", target_chat_id)
+    except RetryAfter as error:
+        delay = min(error.retry_after + 1, MAX_REDDIT_BACKOFF)
+        logger.warning("Telegram rate limit (429); retrying startup message in %.0f seconds.", delay)
+        await asyncio.sleep(delay)
+        await application.bot.send_message(
+            chat_id=target_chat_id,
+            text="✅ Bot is online and listening for commands.",
+        )
+        logger.info("Startup notification sent to target chat %s.", target_chat_id)
+    except TelegramError:
+        logger.exception("Could not send startup notification to target chat %s.", target_chat_id)
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Logs polling and handler failures with an actionable cause."""
+    del update
+    error = context.error
+    if isinstance(error, Conflict):
+        logger.error(
+            "Telegram polling conflict: another process is already using this bot token. "
+            "Stop the duplicate process and run only one bot instance."
+        )
+        return
+
+    logger.error("Unhandled Telegram error: %s", error, exc_info=error)
+
 def main():
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    # python-telegram-bot 21.6 expects a current loop during run_polling().
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(notify_bot_started)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler(["sub", "subreddit"], subreddit_command))
     application.add_handler(CommandHandler("chatid", chat_id_command))
     application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_error_handler(error_handler)
 
     job_queue = application.job_queue
     # Checks the selected subreddit every 30 seconds.
-    job_queue.run_repeating(check_reddit_rss, interval=30, first=5)
+    job_queue.run_repeating(check_reddit_rss, interval=RSS_POLL_INTERVAL, first=5)
 
     print(f"[*] r/{bot_state['subreddit']} [FS] RSS monitor running every 30 seconds.")
     # Discard updates accumulated while the bot was stopped. Only one process
