@@ -212,12 +212,41 @@ async def check_reddit_rss(context: ContextTypes.DEFAULT_TYPE):
     try:
         async with reddit_request_lock:
             subreddit = bot_state["subreddit"]
-            rss_url = f"https://www.reddit.com/r/{subreddit}/new.rss"
-            response = await asyncio.to_thread(
-                requests.get, rss_url, headers=HEADERS, timeout=15
+            candidates = (
+                f"https://www.reddit.com/r/{subreddit}/new/.rss",
+                f"https://www.reddit.com/r/{subreddit}/new.json?limit=100&raw_json=1",
+                f"https://www.reddit.com/r/{subreddit}/new.rss",
             )
+            entries = []
+            final_status = None
+            for url in candidates:
+                response = await asyncio.to_thread(
+                    requests.get, url, headers=HEADERS, timeout=15
+                )
+                final_status = response.status_code
+                if response.status_code != 200:
+                    continue
 
-        if response.status_code == 429:
+                if url.endswith(".json?limit=100&raw_json=1"):
+                    payload = response.json()
+                    for child in payload.get("data", {}).get("children", []):
+                        listing = child.get("data", {})
+                        if not listing:
+                            continue
+                        entries.append({
+                            "id": f"t3_{listing['id']}",
+                            "title": listing.get("title", ""),
+                            "link": f"https://www.reddit.com{listing.get('permalink', '')}",
+                            "author": listing.get("author", "Unknown"),
+                        })
+                else:
+                    feed = feedparser.parse(response.text)
+                    entries.extend(feed.entries)
+
+                if entries:
+                    break
+
+        if final_status == 429:
             retry_after = response.headers.get("Retry-After")
             try:
                 delay = max(float(retry_after), RSS_POLL_INTERVAL) if retry_after else reddit_backoff
@@ -226,23 +255,38 @@ async def check_reddit_rss(context: ContextTypes.DEFAULT_TYPE):
             reddit_retry_at = time.monotonic() + min(delay, MAX_REDDIT_BACKOFF)
             reddit_backoff = min(reddit_backoff * 2, MAX_REDDIT_BACKOFF)
             logger.warning(
-                "Reddit RSS rate limit (429); retrying in %.0f seconds.",
+                "Reddit feed rate limit (429); retrying in %.0f seconds.",
                 min(delay, MAX_REDDIT_BACKOFF),
             )
             return
 
-        if response.status_code != 200:
-            logger.warning("Reddit RSS returned status code %s", response.status_code)
+        if final_status in (403, 401):
+            delay = min(MAX_REDDIT_BACKOFF, max(reddit_backoff * 2, 5 * 60))
+            reddit_retry_at = time.monotonic() + delay
+            reddit_backoff = min(reddit_backoff * 2, MAX_REDDIT_BACKOFF)
+            logger.warning(
+                "Reddit feed for r/%s was denied access (%s); retrying in %.0f seconds.",
+                subreddit,
+                final_status,
+                delay,
+            )
+            return
+
+        if final_status != 200:
+            reddit_backoff = RSS_POLL_INTERVAL
+            reddit_retry_at = time.monotonic() + reddit_backoff
+            logger.warning(
+                "Reddit feed for r/%s is unavailable (HTTP %s); retrying in %s seconds.",
+                subreddit,
+                final_status,
+                reddit_backoff,
+            )
             return
 
         reddit_backoff = RSS_POLL_INTERVAL
         reddit_retry_at = 0.0
 
-        feed = feedparser.parse(response.text)
-        if not feed or not feed.entries:
-            return
-
-        for entry in reversed(feed.entries):
+        for entry in reversed(entries):
             post_id = entry.get("id", entry.get("link"))
             if not post_id or post_id in bot_state["seen_ids"]:
                 continue
